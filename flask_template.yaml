@@ -1,0 +1,222 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: CloudFormation template to create an Auto Scaling group with min 1 and max 2 instances, installing Python, httpd, and setting up a Flask app with virtualenv.
+
+Parameters:
+  VpcId:
+    Type: String
+    Description: VPC ID where the Auto Scaling group will be deployed.
+  
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: List of subnet IDs where instances will be launched.
+  
+  InstanceType:
+    Type: String
+    Default: t2.micro
+    Description: EC2 instance type.
+  
+  AmiId:
+    Type: String
+    Description: AMI ID to launch the EC2 instances.
+
+  DeploymentVersion:
+    Type: String
+    Description: Please provide deployment version
+
+  SourceCode:
+    Type: String
+    Description: Please provide S3 URI for source code.
+
+Resources:
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow all traffic from 10.0.0.0/8
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: -1
+          CidrIp: 10.0.0.0/8
+      Tags: 
+        - Key: service_id
+          Value: flaskapp
+        - Key: service_data
+          Value: env=tst
+        - Key: admin_contact
+          Value: casaws.ops
+
+  FlaskIAMrole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2RoleforSSM
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+      Tags:
+        - Key: service_id
+          Value: flaskapp
+        - Key: service_data
+          Value: env=tst
+        - Key: admin_contact
+          Value: casaws.ops
+  
+  ALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      IpAddressType: ipv4
+      Name: Flask-App-ALB-cloudformation
+      Scheme: internal
+      SecurityGroups: 
+        - !Ref SecurityGroup
+      Subnets: !Ref SubnetIds
+      Tags: 
+        - Key: service_id
+          Value: flaskapp
+        - Key: service_data
+          Value: env=tst
+        - Key: admin_contact
+          Value: casaws.ops
+      Type: application
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckPath: /status
+      IpAddressType: ipv4 
+      Name: flask-app-tg-cloudformation
+      Port: 80
+      Protocol: HTTP 
+      Tags: 
+        - Key: service_id
+          Value: flaskapp
+        - Key: service_data
+          Value: env=tst
+        - Key: admin_contact
+          Value: casaws.ops
+      TargetType: instance 
+      VpcId: !Ref VpcId
+
+  ALBListner:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions: 
+        - ForwardConfig: 
+            TargetGroups: 
+              - TargetGroupArn: !Ref TargetGroup
+                Weight: 1
+          Order: 1
+          Type: forward 
+      LoadBalancerArn: !Ref ALB
+      Port: 80
+      Protocol: HTTP 
+
+  Route53record:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: Z1QI7ZYHFD8E31
+      Name: flaskapp.cas-sbx.aws.qualcomm.com
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt ALB.DNSName
+        HostedZoneId: !GetAtt ALB.CanonicalHostedZoneID
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: Flaskapp-instanceprofile
+      Roles: 
+        - !Ref FlaskIAMrole
+
+
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: FlaskApp-template
+      LaunchTemplateData:
+        DisableApiTermination: true
+        ImageId: !Ref AmiId
+        InstanceType: t2.micro
+#        KeyName: !Ref KeyName
+        SecurityGroupIds:
+          - !Ref SecurityGroup
+        IamInstanceProfile: 
+          Arn: !GetAtt InstanceProfile.Arn
+        TagSpecifications:
+          - ResourceType: "instance"
+            Tags:
+            - Key: "Version"
+              Value: !Ref DeploymentVersion
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            sudo su
+            yum update -y
+            yum install -y python3 python3-venv httpd mod_proxy_html mod_proxy_http
+            cat <<EOF >> /etc/httpd/conf/httpd.conf
+            <VirtualHost *:80>
+                ProxyPreserveHost On
+                ProxyPass / http://localhost:5000/
+                ProxyPassReverse / http://localhost:5000/
+            </VirtualHost>
+            EOF
+            systemctl start httpd
+            systemctl enable httpd
+            mkdir -p /local/mnt/server
+            python3 -m venv /local/mnt/server/venv
+            chmod 777 activate
+            source /local/mnt/server/venv/bin/activate
+            pip3 install flask
+            aws s3 cp ${SourceCode} /local/mnt/server/
+            source /local/mnt/server/venv/bin/activate
+            FLASK_APP=/local/mnt/server/app.py flask run --host=0.0.0.0 &
+
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier: !Ref SubnetIds
+      LaunchTemplate: 
+        LaunchTemplateId: !GetAtt LaunchTemplate.LaunchTemplateId
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      MinSize: '1'
+      MaxSize: '2'
+      DesiredCapacity: '1'
+      TargetGroupARNs: 
+        - !Ref TargetGroup
+      Tags: 
+        - Key: service_id
+          Value: flaskapp
+          PropagateAtLaunch: true
+        - Key: service_data
+          Value: env=tst
+          PropagateAtLaunch: true
+        - Key: admin_contact
+          Value: casaws.ops
+          PropagateAtLaunch: true
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MaxBatchSize: 1
+        MinActiveInstancesPercent: 90
+        MinInstancesInService: 1
+        MinSuccessfulInstancesPercent: 100
+        SuspendProcesses:
+          - HealthCheck
+          - ReplaceUnhealthy
+        WaitOnResourceSignals: false
+
+Outputs:
+  AutoScalingGroupName:
+    Description: Name of the Auto Scaling group
+    Value: !Ref AutoScalingGroup
+
+  SecurityGroupId:
+    Description: Security Group ID
+    Value: !Ref SecurityGroup
+  
+  ALBDNSRecord:
+    Description: "The DNS record for the ALB"
+    Value: !Ref Route53record
